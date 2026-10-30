@@ -42,14 +42,7 @@ Implement `room_task` (one function, started twice; `room = (int)(intptr_t)arg`,
 - Log `EVT_ROOM_OCCUPIED/VACANT` and `EVT_LIGHT_ON/OFF` only on changes (not every loop).
 - Done when: motion in a room turns its light on, and the light turns off after the timeout. Both rooms work independently.
 
-### Namayanja Rahmat: `src/report.c` (reports and energy estimate)
-Implement `report_print_summary()` and `report_print_inside()` (declared in `shared.h`).
-- Summary: building count, each room's occupied/vacant and light on/off, current access window.
-- Inside list: names/UIDs of users currently inside.
-- **Innovation:** an energy-saved estimate per room. Assume a lamp wattage, compare lights-on time (`light_on_seconds`) against the time they would have been on without automation, and print Wh saved.
-- Copy state under the lock, release it, then print.
-- Also test Room 2 behaviour with Macalvin's code and report bugs to him.
-- Done when: the functions print correct information for changing state.
+
 
 ### Ariko Joseph Ojangole: `src/storage.c` and `src/cli.c`
 `storage_task` (storage.c):
