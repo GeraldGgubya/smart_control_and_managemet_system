@@ -8,7 +8,7 @@
  *   2. decide  : unknown tag / outside hours / anti-passback / not inside / GRANT
  *                (check + state update happen inside ONE STATE_LOCK so they are atomic)
  *   3. act     : servo + green LED on grant; red LED + buzzer on deny (no blocking delays)
- *   4. log     : log_event(...) for every attempt
+ *   4. log     : log_event(...) for every attempt, plus a message on the console
  */
 #include <ctype.h>
 #include <stdio.h>
@@ -35,6 +35,9 @@ static const char *TAG = "access";
 #define SERVO_RES_BITS 14
 
 #define RFID_SPI_HOST SPI2_HOST /* must match the host storage.c uses for the SD card */
+
+/* Set to 0 once the card reading works, to silence the debug lines. */
+#define RFID_DEBUG 0
 
 /* ------------------------------------------------------------------ */
 /* Tiny non-blocking timer (tick based, wrap-safe)                     */
@@ -147,7 +150,9 @@ static void outputs_service(void)
 enum
 {
     REG_COMMAND = 0x01,
+    REG_COMIEN = 0x02,
     REG_COMIRQ = 0x04,
+    REG_DIVIRQ = 0x05,
     REG_ERROR = 0x06,
     REG_FIFODATA = 0x09,
     REG_FIFOLEVEL = 0x0A,
@@ -195,6 +200,26 @@ static void rc_write(door_id_t d, uint8_t reg, uint8_t val)
     xSemaphoreGive(g_spi_mutex);
 }
 
+/* Reads n bytes from the FIFO in ONE transaction, the way the standard MFRC522
+ * libraries do: the address byte is repeated n times, then a final 0x00. The data
+ * for each address arrives one byte later, so the result starts at rx[1].
+ * (Reading the FIFO one byte per transaction returned every second byte in Wokwi.) */
+static void rc_read_fifo(door_id_t d, uint8_t *out, uint8_t n)
+{
+    uint8_t addr = (uint8_t)(((REG_FIFODATA << 1) & 0x7E) | 0x80);
+    uint8_t tx[17], rx[17];
+    if (n > 16)
+        n = 16;
+    memset(tx, addr, n);
+    tx[n] = 0x00;
+    memset(rx, 0, sizeof rx);
+    spi_transaction_t t = {.length = (size_t)(n + 1) * 8, .tx_buffer = tx, .rx_buffer = rx};
+    xSemaphoreTake(g_spi_mutex, portMAX_DELAY);
+    spi_device_transmit(s_rc[d], &t);
+    xSemaphoreGive(g_spi_mutex);
+    memcpy(out, rx + 1, n);
+}
+
 static void rc_set_bits(door_id_t d, uint8_t reg, uint8_t mask) { rc_write(d, reg, rc_read(d, reg) | mask); }
 static void rc_clr_bits(door_id_t d, uint8_t reg, uint8_t mask) { rc_write(d, reg, rc_read(d, reg) & (uint8_t)~mask); }
 
@@ -220,35 +245,48 @@ static bool rc_transceive(door_id_t d, const uint8_t *tx, uint8_t tx_len, uint8_
                           uint8_t *rx, uint8_t *rx_len)
 {
     rc_write(d, REG_COMMAND, CMD_IDLE);
+    rc_write(d, REG_COMIEN, 0xF7); /* enable interrupt sources (as the Arduino library does) */
+    rc_clr_bits(d, REG_DIVIRQ, 0x80);
     rc_write(d, REG_COMIRQ, 0x7F);    /* clear all interrupt flags */
     rc_write(d, REG_FIFOLEVEL, 0x80); /* flush FIFO                */
     for (uint8_t i = 0; i < tx_len; i++)
         rc_write(d, REG_FIFODATA, tx[i]);
     rc_write(d, REG_BITFRAMING, tx_bits);
     rc_write(d, REG_COMMAND, CMD_TRANSCEIVE);
-    rc_set_bits(d, REG_BITFRAMING, 0x80); /* StartSend                 */
+    rc_write(d, REG_BITFRAMING, (uint8_t)(0x80 | tx_bits)); /* StartSend + bit count */
 
+    uint8_t irq = 0;
     bool done = false;
     for (int i = 0; i < 6 && !done; i++)
     { /* up to ~60 ms              */
-        uint8_t irq = rc_read(d, REG_COMIRQ);
+        irq = rc_read(d, REG_COMIRQ);
         if (irq & 0x30)
             done = true; /* RxIRq or IdleIRq          */
         else if (irq & 0x01)
-            return false; /* TimerIRq: no card replied */
+            break; /* TimerIRq: no card replied */
         else
             vTaskDelay(1);
     }
+    uint8_t err = rc_read(d, REG_ERROR);
+
+#if RFID_DEBUG
+    static int calls[2]; /* prints about every 2 s per reader */
+    if (++calls[d] % 20 == 0)
+    {
+        ESP_LOGI(TAG, "DEBUG door %d: cmd=%02X irq=%02X err=%02X level=%d done=%d",
+                 d, tx[0], irq, err, rc_read(d, REG_FIFOLEVEL), done);
+    }
+#endif
+
     if (!done)
         return false;
-    if (rc_read(d, REG_ERROR) & 0x13)
+    if (err & 0x13)
         return false; /* buffer overflow, parity, protocol */
 
     uint8_t n = rc_read(d, REG_FIFOLEVEL);
     if (n == 0 || n > *rx_len)
         return false;
-    for (uint8_t i = 0; i < n; i++)
-        rx[i] = rc_read(d, REG_FIFODATA);
+    rc_read_fifo(d, rx, n);
     *rx_len = n;
     return true;
 }
@@ -263,14 +301,31 @@ static bool rc_read_uid(door_id_t d, char uid_out[UID_LEN])
     len = 2;
     if (!rc_transceive(d, &reqa, 1, 7, buf, &len) || len != 2)
         return false;
+#if RFID_DEBUG
+    ESP_LOGI(TAG, "DEBUG door %d: REQA ok, ATQA=%02X%02X", d, buf[0], buf[1]);
+#endif
 
     uint8_t anticoll[2] = {0x93, 0x20}; /* anti-collision, cascade 1  */
     len = 8;
     if (!rc_transceive(d, anticoll, 2, 0, buf, &len) || len != 5)
+    {
+#if RFID_DEBUG
+        ESP_LOGW(TAG, "DEBUG door %d: anti-collision FAILED (len=%d)", d, len);
+#endif
         return false;
+    }
+#if RFID_DEBUG
+    ESP_LOGI(TAG, "DEBUG door %d: raw %02X %02X %02X %02X bcc=%02X", d,
+             buf[0], buf[1], buf[2], buf[3], buf[4]);
+#endif
 
     if ((buf[0] ^ buf[1] ^ buf[2] ^ buf[3]) != buf[4])
-        return false; /* check byte (BCC) */
+    { /* check byte (BCC) */
+#if RFID_DEBUG
+        ESP_LOGW(TAG, "DEBUG door %d: BCC check FAILED", d);
+#endif
+        return false;
+    }
 
     snprintf(uid_out, UID_LEN, "%02X%02X%02X%02X", buf[0], buf[1], buf[2], buf[3]);
     return true;
