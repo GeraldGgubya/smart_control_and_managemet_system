@@ -102,8 +102,7 @@ extern QueueHandle_t      g_log_queue;     /* log_event_t items -> storage_task 
 extern EventGroupHandle_t g_events;        /* EVT_BIT_* flags */
 extern QueueHandle_t      g_scan_queue[2]; /* indexed by door_id_t; simulated tag scans */
 
-/*
- * LOCKING RULES (read these, Ariko will be asked to explain them):
+/*:
  *  1. Hold g_state_mutex only for short, non-blocking sections. Never do SD, SPI,
  *     serial printing, or vTaskDelay while holding it.
  *  2. If you need both mutexes, take g_state_mutex FIRST, g_spi_mutex second
